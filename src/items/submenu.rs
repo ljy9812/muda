@@ -5,9 +5,11 @@
 use std::{cell::RefCell, mem, rc::Rc};
 
 use crate::{
-    dpi::Position, sealed::IsMenuItemBase, util::AddOp, ContextMenu, Icon, IsMenuItem, MenuId,
+    sealed::IsMenuItemBase, util::AddOp, ContextMenu, Icon, IsMenuItem, MenuId,
     MenuItemKind, NativeIcon,
 };
+#[cfg(not(target_env = "ohos"))]
+use crate::dpi::Position;
 
 /// A menu that can be added to a [`Menu`] or another [`Submenu`].
 ///
@@ -157,6 +159,17 @@ impl Submenu {
         self.inner.borrow().items()
     }
 
+    /// Shows this submenu as a context menu.
+    ///
+    /// - `x` and `y` are relative to the window top-left corner.
+    ///   If `None`, the cursor position is used.
+    ///
+    /// Returns `Ok(())` if the menu was shown successfully.
+    #[cfg(target_env = "ohos")]
+    pub fn popup(&self, x: Option<f64>, y: Option<f64>) -> crate::Result<()> {
+        self.inner.borrow().popup(x, y)
+    }
+
     /// Get the text for this submenu.
     pub fn text(&self) -> String {
         self.inner.borrow().text()
@@ -275,6 +288,7 @@ impl ContextMenu for Submenu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     fn show_context_menu_for_gtk_window(
@@ -295,6 +309,7 @@ impl ContextMenu for Submenu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     fn gtk_context_menu(&self) -> gtk::Menu {
@@ -315,6 +330,11 @@ impl ContextMenu for Submenu {
     #[cfg(target_os = "macos")]
     fn ns_menu(&self) -> *mut std::ffi::c_void {
         self.inner.borrow().ns_menu()
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn ohos_context_menu(&self) -> String {
+        self.inner.borrow().to_json()
     }
 
     fn as_submenu(&self) -> Option<&Submenu> {

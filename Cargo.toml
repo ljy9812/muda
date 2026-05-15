@@ -43,7 +43,7 @@ features = [
   "Win32_UI_Controls",
 ]
 
-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"), not(target_env = "ohos")))'.dependencies]
 gtk = { version = "0.18", optional = true }
 libxdo = { version = "0.6.0", optional = true }
 
@@ -77,6 +77,13 @@ objc2-app-kit = { version = "0.3.0", default-features = false, features = [
   "NSWindow",
 ] }
 png = "0.18"
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+png = "0.18"
+openharmony-ability = { path = "../openharmony-ability/crates/ability", features = ["menu"] }
 
 [dev-dependencies]
 winit = "0.30"

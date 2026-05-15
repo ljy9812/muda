@@ -408,6 +408,7 @@ pub trait ContextMenu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     fn show_context_menu_for_gtk_window(
@@ -427,6 +428,7 @@ pub trait ContextMenu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     fn gtk_context_menu(&self) -> gtk::Menu;
@@ -453,6 +455,13 @@ pub trait ContextMenu {
     /// you need it to be alive for longer, retain it.
     #[cfg(target_os = "macos")]
     fn ns_menu(&self) -> *mut std::ffi::c_void;
+
+    /// Get the underlying OHOS menu data for context menus.
+    ///
+    /// Returns a JSON string representing the menu structure,
+    /// which can be passed to the OHOS statusBarManager API.
+    #[cfg(target_env = "ohos")]
+    fn ohos_context_menu(&self) -> String;
 
     /// Cast this context menu to a [`Menu`], and returns `None` if it wasn't.
     fn as_menu(&self) -> Option<&Menu> {

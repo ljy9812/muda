@@ -13,12 +13,16 @@ mod platform;
         target_os = "netbsd",
         target_os = "openbsd"
     ),
+    not(target_env = "ohos"),
     feature = "gtk"
 ))]
 #[path = "gtk/mod.rs"]
 mod platform;
 #[cfg(target_os = "macos")]
 #[path = "macos/mod.rs"]
+mod platform;
+#[cfg(target_env = "ohos")]
+#[path = "ohos/mod.rs"]
 mod platform;
 
 use std::{

@@ -4,7 +4,9 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use crate::{dpi::Position, util::AddOp, ContextMenu, IsMenuItem, MenuId, MenuItemKind};
+use crate::{util::AddOp, ContextMenu, IsMenuItem, MenuId, MenuItemKind};
+#[cfg(not(target_env = "ohos"))]
+use crate::dpi::Position;
 
 /// A root menu that can be added to a Window on Windows and Linux
 /// and used as the app global menu on macOS.
@@ -161,6 +163,17 @@ impl Menu {
         self.inner.borrow().items()
     }
 
+    /// Shows this menu as a context menu.
+    ///
+    /// - `x` and `y` are relative to the window top-left corner.
+    ///   If `None`, the cursor position is used.
+    ///
+    /// Returns `Ok(())` if the menu was shown successfully.
+    #[cfg(target_env = "ohos")]
+    pub fn popup(&self, x: Option<f64>, y: Option<f64>) -> crate::Result<()> {
+        self.inner.borrow().popup(x, y)
+    }
+
     /// Adds this menu to a [`gtk::Window`]
     ///
     /// - `container`: this is an optional paramter to specify a container for the [`gtk::MenuBar`],
@@ -190,6 +203,7 @@ impl Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     pub fn init_for_gtk_window<W, C>(&self, window: &W, container: Option<&C>) -> crate::Result<()>
@@ -287,6 +301,7 @@ impl Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     pub fn remove_for_gtk_window<W>(&self, window: &W) -> crate::Result<()>
@@ -315,6 +330,7 @@ impl Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     pub fn hide_for_gtk_window<W>(&self, window: &W) -> crate::Result<()>
@@ -343,6 +359,7 @@ impl Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     pub fn show_for_gtk_window<W>(&self, window: &W) -> crate::Result<()>
@@ -371,6 +388,7 @@ impl Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     pub fn is_visible_on_gtk_window<W>(&self, window: &W) -> bool
@@ -388,6 +406,7 @@ impl Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     /// Returns the [`gtk::MenuBar`] that is associated with this window if it exists.
@@ -453,6 +472,7 @@ impl ContextMenu for Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     fn show_context_menu_for_gtk_window(
@@ -473,6 +493,7 @@ impl ContextMenu for Menu {
             target_os = "netbsd",
             target_os = "openbsd"
         ),
+        not(target_env = "ohos"),
         feature = "gtk"
     ))]
     fn gtk_context_menu(&self) -> gtk::Menu {
@@ -493,6 +514,11 @@ impl ContextMenu for Menu {
     #[cfg(target_os = "macos")]
     fn ns_menu(&self) -> *mut std::ffi::c_void {
         self.inner.borrow().ns_menu()
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn ohos_context_menu(&self) -> String {
+        self.inner.borrow().to_json()
     }
 
     fn as_menu(&self) -> Option<&Menu> {
