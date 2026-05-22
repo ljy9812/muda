@@ -44,6 +44,10 @@ pub enum Error {
     AlreadyInitialized,
     #[error(transparent)]
     AcceleratorParseError(#[from] AcceleratorParseError),
+    #[error("Custom error: {0}")]
+    CustomError(String),
+    #[error("Operation not supported on this platform")]
+    NotSupportedOnPlatform,
 }
 
 /// Convenient type alias of Result type for muda.
