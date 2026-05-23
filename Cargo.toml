@@ -85,8 +85,10 @@ base64 = "0.22"
 png = "0.18"
 openharmony-ability = { path = "../openharmony-ability/crates/ability", features = ["menu"] }
 
-[dev-dependencies]
+[target.'cfg(not(target_env = "ohos"))'.dev-dependencies]
 winit = "0.30"
 tao = "0.33"
 wry = "0.45"
+
+[dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
