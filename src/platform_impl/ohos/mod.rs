@@ -147,6 +147,7 @@ pub struct MenuChild {
     checked: Option<Arc<AtomicBool>>,
     is_syncing_checked_state: Option<Arc<AtomicBool>>,
     icon: Option<Icon>,
+    native_icon: Option<String>,
     pub children: Option<Vec<Rc<RefCell<MenuChild>>>>,
 }
 
@@ -166,6 +167,7 @@ impl MenuChild {
             checked: None,
             children: None,
             icon: None,
+            native_icon: None,
             is_syncing_checked_state: None,
             predefined_item_type: None,
         }
@@ -179,6 +181,7 @@ impl MenuChild {
             children: Some(Vec::new()),
             item_type: MenuItemType::Submenu,
             icon: None,
+            native_icon: None,
             is_syncing_checked_state: None,
             predefined_item_type: None,
             accelerator: None,
@@ -197,6 +200,7 @@ impl MenuChild {
             checked: None,
             children: None,
             icon: None,
+            native_icon: None,
             is_syncing_checked_state: None,
         }
     }
@@ -218,6 +222,7 @@ impl MenuChild {
             item_type: MenuItemType::Check,
             children: None,
             icon: None,
+            native_icon: None,
             predefined_item_type: None,
         }
     }
@@ -233,6 +238,7 @@ impl MenuChild {
             text: text.to_string(),
             enabled,
             icon,
+            native_icon: None,
             accelerator: key_accelerator,
             id: id.unwrap_or_else(|| MenuId(COUNTER.next().to_string())),
             item_type: MenuItemType::Icon,
@@ -246,7 +252,7 @@ impl MenuChild {
     pub fn new_native_icon(
         text: &str,
         enabled: bool,
-        _native_icon: Option<NativeIcon>,
+        native_icon: Option<NativeIcon>,
         key_accelerator: Option<KeyAccelerator>,
         id: Option<MenuId>,
     ) -> Self {
@@ -259,9 +265,33 @@ impl MenuChild {
             children: None,
             checked: None,
             icon: None,
+            native_icon: native_icon.and_then(native_icon_to_ohos).map(|s| s.to_string()),
             is_syncing_checked_state: None,
             predefined_item_type: None,
         }
+    }
+}
+
+/// Map NativeIcon variants to OHOS system symbol resource names.
+///
+/// Only a few NativeIcon variants have confirmed OHOS system symbol equivalents
+/// at API 12 (compileSdkVersion 5.0.0). Most of the 56 NativeIcon variants are
+/// macOS-specific UI metaphors with no OHOS counterpart.
+///
+/// Validated symbols: ohos_star (Add), ohos_lock (LockLocked), ohos_wifi (Network).
+/// All other variants map to `None` (no icon), consistent with Windows/Linux behavior
+/// where unmapped NativeIcons render without an icon.
+///
+/// When the SDK adds more system symbols (e.g. ohos_trash, ohos_share), this mapping
+/// can be extended. The ArkTS side (MenuBarComponent.nativeIconSymbol) must also be
+/// updated with a matching `$r()` case.
+fn native_icon_to_ohos(icon: NativeIcon) -> Option<&'static str> {
+    match icon {
+        NativeIcon::Add => Some("sys.symbol.ohos_star"),
+        NativeIcon::LockLocked => Some("sys.symbol.ohos_lock"),
+        NativeIcon::Network => Some("sys.symbol.ohos_wifi"),
+        // All other variants: no confirmed system symbol at API 12
+        _ => None,
     }
 }
 
@@ -315,6 +345,7 @@ impl MenuChild {
                 let png_data = encode_rgba_to_png(&i.inner.raw, i.inner.width, i.inner.height);
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data)
             }),
+            native_icon: self.native_icon.clone(),
             submenu_items: self.children.as_ref().map(|c| {
                 c.iter().map(|child| child.borrow().to_menu_item_data()).collect()
             }),
@@ -387,6 +418,10 @@ impl MenuChild {
 impl MenuChild {
 pub fn set_icon(&mut self, icon: Option<Icon>) {
         self.icon = icon;
+    }
+
+    pub fn set_native_icon(&mut self, icon: Option<NativeIcon>) {
+        self.native_icon = icon.and_then(native_icon_to_ohos).map(|s| s.to_string());
     }
 }
 
