@@ -166,8 +166,8 @@ impl Submenu {
     ///
     /// Returns `Ok(())` if the menu was shown successfully.
     #[cfg(target_env = "ohos")]
-    pub fn popup(&self, x: Option<f64>, y: Option<f64>) -> crate::Result<()> {
-        self.inner.borrow().popup(x, y)
+    pub fn popup(&self, x: Option<f64>, y: Option<f64>, window_id: &str) -> crate::Result<()> {
+        self.inner.borrow().popup(x, y, window_id)
     }
 
     /// Get the text for this submenu.
