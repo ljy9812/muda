@@ -34,6 +34,23 @@ use crate::{items::*, IsMenuItem, MenuItemKind, MenuItemType};
 
 pub(crate) use self::platform::*;
 
+// Public re-export so tray-icon can inject the MenuClient at startup.
+// muda does not hold an OpenHarmonyApp; tray-icon's set_ohos_app creates the client.
+#[cfg(target_env = "ohos")]
+pub use self::platform::set_menu_client;
+
+/// Public re-export so tray-icon can bridge StatusBar menu clicks into muda's
+/// menu event channel.
+#[cfg(target_env = "ohos")]
+pub use self::platform::send_menu_event;
+
+/// Public re-export so tauri's window helpers can dispatch menu bridge calls
+/// onto muda's single FIFO worker, serialising set_menu/remove_menu/visibility
+/// operations (fixes Menu Bar flicker when real data arrives 1ms before the
+/// empty "remove_menu" dispatch from a different executor).
+#[cfg(target_env = "ohos")]
+pub use self::platform::dispatch_menu_bridge_call;
+
 impl dyn IsMenuItem + '_ {
     fn child(&self) -> Rc<RefCell<MenuChild>> {
         match self.kind() {

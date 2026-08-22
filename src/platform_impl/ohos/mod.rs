@@ -57,13 +57,100 @@ impl fmt::Display for KeyAccelerator {
     }
 }
 
+// Use openharmony-ability-plugin-menu's MenuItemData for serialization
+use openharmony_ability_plugin_menu::MenuItemData;
+
 static COUNTER: Counter = Counter::new();
 
 static CHECK_ITEMS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
-// Use openharmony-ability's MenuItemData for serialization
-use openharmony_ability::menu::MenuItemData;
+// ─── MenuClient initialization (injected by tray-icon or tauri) ─────────────
+// muda does not hold an OpenHarmonyApp reference; tray-icon's set_ohos_app
+// creates a MenuClient and injects it here via set_menu_client().
+
+static MENU_CLIENT: once_cell::sync::OnceCell<openharmony_ability_plugin_menu::MenuClient> =
+    once_cell::sync::OnceCell::new();
+
+/// Called by tray-icon (or tauri) at startup to inject the MenuClient.
+/// muda does not create its own MenuClient (it does not hold OpenHarmonyApp).
+pub fn set_menu_client(client: openharmony_ability_plugin_menu::MenuClient) {
+    if MENU_CLIENT.set(client).is_err() {
+        panic!("MENU_CLIENT already set");
+    }
+    // Eagerly initialize the event channel so the sender is registered with
+    // plugin-menu before any bridge event can arrive.
+    let _ = menu_event_receiver();
+}
+
+pub(crate) fn get_menu_client() -> &'static openharmony_ability_plugin_menu::MenuClient {
+    MENU_CLIENT.get().expect("MENU_CLIENT not initialized")
+}
+
+// ─── Menu event channel (owned by muda) ─────────────────────────────────────
+// muda owns the MENU_EVENT_CHANNEL. The Sender is registered with plugin-menu
+// (via register_menu_event_sender) so on_main_thread_event can forward decoded
+// menu_id strings here. tray-icon also calls send_menu_event() to inject tray
+// menu clicks into this channel. The event listener thread (start_event_listener)
+// consumes from menu_event_receiver().
+
+static MENU_EVENT_CHANNEL: once_cell::sync::Lazy<(
+    crossbeam_channel::Sender<String>,
+    crossbeam_channel::Receiver<String>,
+)> = once_cell::sync::Lazy::new(|| {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    // Register our sender with plugin-menu so bridge events reach this channel.
+    openharmony_ability_plugin_menu::register_menu_event_sender(tx.clone());
+    (tx, rx)
+});
+
+/// Returns the menu event receiver (consumed by muda's event listener thread).
+pub fn menu_event_receiver() -> &'static crossbeam_channel::Receiver<String> {
+    &MENU_EVENT_CHANNEL.1
+}
+
+/// Sends a menu event into muda's channel (called by tray-icon to bridge
+/// StatusBar menu clicks into muda's event stream).
+pub fn send_menu_event(menu_id: String) {
+    let _ = MENU_EVENT_CHANNEL.0.send(menu_id);
+}
+
+// ─── Bridge worker thread ───────────────────────────────────────────────────
+// All MenuClient bridge calls must run on a Rust worker thread, never on the
+// ArkTS/N-API main thread. The main thread owns the TSFN queue; blocking it
+// with futures_executor::block_on prevents the very TSFN callbacks that deliver
+// bridge responses, causing a deadlock (THREAD_BLOCK_6S watchdog). Same pattern
+// as tray-icon's bridge worker. A single FIFO queue serialises menu operations
+// (e.g. set-menubar before popup) and frees the main thread to pump the TSFN
+// event loop so pending calls (tray add, menu set-menubar) can complete.
+
+type MenuBridgeCommand = Box<dyn FnOnce() + Send + 'static>;
+
+fn menu_bridge_worker_tx() -> &'static std::sync::mpsc::Sender<MenuBridgeCommand> {
+    static TX: once_cell::sync::Lazy<std::sync::mpsc::Sender<MenuBridgeCommand>> =
+        once_cell::sync::Lazy::new(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<MenuBridgeCommand>();
+            std::thread::Builder::new()
+                .name("menu-bridge".to_string())
+                .spawn(move || {
+                    log::debug!("[muda] menu bridge worker started");
+                    while let Ok(cmd) = rx.recv() {
+                        cmd();
+                    }
+                    log::debug!("[muda] menu bridge worker exiting");
+                })
+                .expect("Failed to spawn menu-bridge worker thread");
+            tx
+        });
+    &TX
+}
+
+/// Dispatch a menu bridge call to the dedicated worker thread (fire-and-forget).
+pub fn dispatch_menu_bridge_call(f: impl FnOnce() + Send + 'static) {
+    if menu_bridge_worker_tx().send(Box::new(f)).is_err() {
+        log::warn!("[muda] menu bridge worker channel closed, call dropped");
+    }
+}
 
 pub struct Menu {
     id: MenuId,
@@ -122,16 +209,44 @@ impl Menu {
         init_menu_event_listener();
         collect_check_items(&self.children);
         let json = self.to_json();
-        openharmony_ability::menu::popup_context_menu(json, x, y, window_id.to_string())
-            .map_err(|e| crate::Error::CustomError(e.to_string()))?;
+        let request = openharmony_ability_plugin_menu::MenuPopupRequest {
+            json_data: json,
+            x,
+            y,
+            window_id: window_id.to_string(),
+        };
+        // Dispatch to the menu bridge worker (fire-and-forget). The bridge call
+        // must NOT run on the main thread: block_on + receiver.await would
+        // deadlock the TSFN event loop (THREAD_BLOCK_6S).
+        log::info!("[muda] popup: dispatching to worker");
+        dispatch_menu_bridge_call(move || {
+            let client = get_menu_client();
+            log::info!("[muda] worker: popup before block_on");
+            if let Err(e) = futures_executor::block_on(client.popup(request)) {
+                log::warn!("[muda] popup error in worker: {}", e);
+            }
+        });
         Ok(())
     }
 
     pub fn refresh_menubar(&self, window_id: &str) -> crate::Result<()> {
         init_menu_event_listener();
         let json = self.to_json();
-        openharmony_ability::menu::set_menu_json(json, window_id.to_string())
-            .map_err(|e| crate::Error::CustomError(e.to_string()))?;
+        let request = openharmony_ability_plugin_menu::MenuSetMenubarRequest {
+            json_data: json,
+            window_id: window_id.to_string(),
+        };
+        // Dispatch to the menu bridge worker (fire-and-forget). Without this,
+        // window creation's refresh_menubar blocks the main thread on
+        // set_menubar's receiver.await → deadlock (THREAD_BLOCK_6S).
+        log::info!("[muda] refresh_menubar: dispatching to worker");
+        dispatch_menu_bridge_call(move || {
+            let client = get_menu_client();
+            log::info!("[muda] worker: set_menubar before block_on");
+            if let Err(e) = futures_executor::block_on(client.set_menubar(request)) {
+                log::warn!("[muda] set_menubar error in worker: {}", e);
+            }
+        });
         Ok(())
     }
 }
@@ -351,7 +466,7 @@ impl MenuChild {
             }),
             about_metadata: self.predefined_item_type.as_ref().and_then(|t| {
                 if let PredefinedMenuItemType::About(ref metadata) = t {
-                    metadata.as_ref().map(|m| openharmony_ability::menu::AboutMetadataData {
+                    metadata.as_ref().map(|m| openharmony_ability_plugin_menu::AboutMetadataData {
                         name: m.name.clone(),
                         version: m.version.clone(),
                         short_version: m.short_version.clone(),
@@ -472,8 +587,20 @@ impl MenuChild {
             collect_check_items(children);
         }
         let json = self.to_json();
-        openharmony_ability::menu::popup_context_menu(json, x, y, window_id.to_string())
-            .map_err(|e| crate::Error::CustomError(e.to_string()))?;
+        let request = openharmony_ability_plugin_menu::MenuPopupRequest {
+            json_data: json,
+            x,
+            y,
+            window_id: window_id.to_string(),
+        };
+        // Dispatch to the menu bridge worker (fire-and-forget) — see Menu::popup.
+        log::info!("[muda] submenu popup: dispatching to worker");
+        dispatch_menu_bridge_call(move || {
+            let client = get_menu_client();
+            if let Err(e) = futures_executor::block_on(client.popup(request)) {
+                log::warn!("[muda] popup error in submenu worker: {}", e);
+            }
+        });
         Ok(())
     }
 }
@@ -519,7 +646,7 @@ fn start_event_listener() {
     }
 
     std::thread::spawn(|| {
-        let receiver = openharmony_ability::menu::menu_event_receiver();
+        let receiver = menu_event_receiver();
         while let Ok(menu_id) = receiver.recv() {
             {
                 let guard = CHECK_ITEMS.lock().unwrap();
@@ -820,5 +947,489 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0]["type"], "item");
         assert_eq!(children[0]["id"], "open_id");
+    }
+
+    // ─── native_icon_to_ohos ──────────────────────────────────────────────
+
+    #[test]
+    fn native_icon_add_maps_to_ohos_star() {
+        assert_eq!(native_icon_to_ohos(NativeIcon::Add), Some("sys.symbol.ohos_star"));
+    }
+
+    #[test]
+    fn native_icon_lock_locked_maps_to_ohos_lock() {
+        assert_eq!(native_icon_to_ohos(NativeIcon::LockLocked), Some("sys.symbol.ohos_lock"));
+    }
+
+    #[test]
+    fn native_icon_network_maps_to_ohos_wifi() {
+        assert_eq!(native_icon_to_ohos(NativeIcon::Network), Some("sys.symbol.ohos_wifi"));
+    }
+
+    #[test]
+    fn native_icon_unmapped_returns_none() {
+        // Variants without a confirmed OHOS system symbol return None
+        assert_eq!(native_icon_to_ohos(NativeIcon::Bluetooth), None);
+        assert_eq!(native_icon_to_ohos(NativeIcon::Bookmarks), None);
+        assert_eq!(native_icon_to_ohos(NativeIcon::Caution), None);
+        assert_eq!(native_icon_to_ohos(NativeIcon::Folder), None);
+        assert_eq!(native_icon_to_ohos(NativeIcon::TrashEmpty), None);
+    }
+
+    #[test]
+    fn menu_child_new_native_icon_maps_icon() {
+        let child = MenuChild::new_native_icon("Add", true, Some(NativeIcon::Add), None, None);
+        let data = child.to_menu_item_data();
+        assert_eq!(data.native_icon, Some("sys.symbol.ohos_star".to_string()));
+    }
+
+    #[test]
+    fn menu_child_new_native_icon_unmapped_is_none() {
+        let child = MenuChild::new_native_icon("Bluetooth", true, Some(NativeIcon::Bluetooth), None, None);
+        let data = child.to_menu_item_data();
+        assert_eq!(data.native_icon, None);
+    }
+
+    #[test]
+    fn menu_child_set_native_icon_updates_mapping() {
+        let mut child = MenuChild::new_native_icon("X", true, Some(NativeIcon::Bluetooth), None, None);
+        assert_eq!(child.native_icon, None);
+        child.set_native_icon(Some(NativeIcon::Add));
+        assert_eq!(child.native_icon, Some("sys.symbol.ohos_star".to_string()));
+    }
+
+    #[test]
+    fn menu_child_set_native_icon_to_none() {
+        let mut child = MenuChild::new_native_icon("X", true, Some(NativeIcon::Add), None, None);
+        assert!(child.native_icon.is_some());
+        child.set_native_icon(None);
+        assert_eq!(child.native_icon, None);
+    }
+
+    // ─── KeyAccelerator Display: additional branches ─────────────────────
+
+    #[test]
+    fn key_accelerator_display_super_modifier() {
+        let accel = KeyAccelerator::new(Some(Modifiers::SUPER), Key::Character("X".into()));
+        assert_eq!(accel.to_string(), "Super+X");
+    }
+
+    #[test]
+    fn key_accelerator_display_all_four_modifiers() {
+        let accel = KeyAccelerator::new(
+            Some(Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT | Modifiers::SUPER),
+            Key::Character("K".into()),
+        );
+        assert_eq!(accel.to_string(), "Ctrl+Shift+Alt+Super+K");
+    }
+
+    #[test]
+    fn key_accelerator_display_shift_only() {
+        let accel = KeyAccelerator::new(Some(Modifiers::SHIFT), Key::Character("A".into()));
+        assert_eq!(accel.to_string(), "Shift+A");
+    }
+
+    #[test]
+    fn key_accelerator_display_alt_only() {
+        let accel = KeyAccelerator::new(Some(Modifiers::ALT), Key::Character("Z".into()));
+        assert_eq!(accel.to_string(), "Alt+Z");
+    }
+
+    #[test]
+    fn key_accelerator_display_fallback_unmapped_key() {
+        // An unmapped Key variant uses the Debug fallback
+        let accel = KeyAccelerator::new(Some(Modifiers::CONTROL), Key::Enter);
+        let s = accel.to_string();
+        assert!(s.starts_with("Ctrl+"));
+    }
+
+    // ─── Menu add/remove/items ───────────────────────────────────────────
+
+    #[test]
+    fn menu_children_append() {
+        let mut menu = Menu::new(None);
+        let item = Rc::new(RefCell::new(MenuChild::new("Item1", true, None, None)));
+        menu.children.push(item);
+        assert_eq!(menu.children.len(), 1);
+    }
+
+    #[test]
+    fn menu_children_insert_at_position() {
+        let mut menu = Menu::new(None);
+        let item1 = Rc::new(RefCell::new(MenuChild::new("Item1", true, None, None)));
+        let item2 = Rc::new(RefCell::new(MenuChild::new("Item2", true, None, None)));
+        menu.children.push(item1);
+        menu.children.insert(0, item2);
+        assert_eq!(menu.children.len(), 2);
+        assert_eq!(menu.children[0].borrow().text(), "Item2");
+        assert_eq!(menu.children[1].borrow().text(), "Item1");
+    }
+
+    #[test]
+    fn menu_children_remove_by_index() {
+        let mut menu = Menu::new(None);
+        let item = Rc::new(RefCell::new(MenuChild::new("Item1", true, None, Some(MenuId::new("removable")))));
+        menu.children.push(item);
+        assert_eq!(menu.children.len(), 1);
+        // Simulate remove: find by id then remove
+        let idx = menu.children.iter().position(|c| c.borrow().id.0 == "removable").unwrap();
+        menu.children.remove(idx);
+        assert_eq!(menu.children.len(), 0);
+    }
+
+    #[test]
+    fn menu_items_returns_kinds() {
+        let mut menu = Menu::new(None);
+        let item = Rc::new(RefCell::new(MenuChild::new("Item1", true, None, None)));
+        menu.children.push(item);
+        let kinds = menu.items();
+        assert_eq!(kinds.len(), 1);
+    }
+
+    #[test]
+    fn menu_to_menu_items_collects_data() {
+        let mut menu = Menu::new(None);
+        let item = Rc::new(RefCell::new(MenuChild::new("Open", true, None, None)));
+        menu.children.push(item);
+        let items = menu.to_menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, Some("Open".to_string()));
+    }
+
+    // ─── MenuChild add/remove/items ──────────────────────────────────────
+
+    #[test]
+    fn submenu_child_add_and_remove_via_children() {
+        let mut submenu = MenuChild::new_submenu("File", true, None);
+        let item = Rc::new(RefCell::new(MenuChild::new("Open", true, None, Some(MenuId::new("open_id")))));
+        submenu.children.as_mut().unwrap().push(item);
+        assert_eq!(submenu.children.as_ref().unwrap().len(), 1);
+
+        // Remove by finding by id
+        let idx = submenu.children.as_ref().unwrap().iter()
+            .position(|c| c.borrow().id.0 == "open_id").unwrap();
+        submenu.children.as_mut().unwrap().remove(idx);
+        assert_eq!(submenu.children.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn submenu_child_to_json() {
+        let mut submenu = MenuChild::new_submenu("Edit", true, None);
+        let cut = MenuChild::new("Cut", true, Some(KeyAccelerator::new(Some(Modifiers::CONTROL), Key::Character("X".into()))), None);
+        submenu.children = Some(vec![Rc::new(RefCell::new(cut))]);
+        let json_str = submenu.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let items = parsed.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["text"], "Cut");
+        assert_eq!(items[0]["accelerator"], "Ctrl+X");
+    }
+
+    #[test]
+    fn submenu_child_to_json_empty() {
+        let submenu = MenuChild::new_submenu("Empty", true, None);
+        let json_str = submenu.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.as_array().unwrap().is_empty());
+    }
+
+    // ─── Check item serialization ─────────────────────────────────────────
+
+    #[test]
+    fn menu_to_json_includes_check_item() {
+        let mut menu = Menu::new(None);
+        let check = MenuChild::new_check("Toggle", true, true, None, Some(MenuId::new("check_id")));
+        menu.children.push(Rc::new(RefCell::new(check)));
+        let json_str = menu.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let items = parsed.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "check");
+        assert_eq!(items[0]["checked"], true);
+        assert_eq!(items[0]["id"], "check_id");
+    }
+
+    #[test]
+    fn menu_to_json_includes_icon_item_with_icon() {
+        let mut menu = Menu::new(None);
+        let icon = Icon {
+            inner: PlatformIcon {
+                raw: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255],
+                width: 2,
+                height: 2,
+            },
+        };
+        let icon_item = MenuChild::new_icon("Colored", true, Some(icon), None, None);
+        menu.children.push(Rc::new(RefCell::new(icon_item)));
+        let json_str = menu.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let items = parsed.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "icon");
+        assert!(items[0]["icon"].as_str().unwrap().len() > 0);
+    }
+
+    // ─── encode_rgba_to_png ───────────────────────────────────────────────
+
+    #[test]
+    fn encode_rgba_to_png_produces_valid_png() {
+        let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255];
+        let png = encode_rgba_to_png(&rgba, 2, 2);
+        // PNG magic bytes
+        assert!(png.len() > 8);
+        assert_eq!(&png[1..4], b"PNG");
+    }
+
+    // ─── collect_check_items ──────────────────────────────────────────────
+
+    #[test]
+    fn collect_check_items_collects_check_states() {
+        let children: Vec<Rc<RefCell<MenuChild>>> = vec![
+            Rc::new(RefCell::new(MenuChild::new_check("A", true, true, None, Some(MenuId::new("c1"))))),
+            Rc::new(RefCell::new(MenuChild::new("Regular", true, None, None))),
+            Rc::new(RefCell::new(MenuChild::new_check("B", true, false, None, Some(MenuId::new("c2"))))),
+        ];
+        collect_check_items(&children);
+        let map = CHECK_ITEMS.lock().unwrap();
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("c1"));
+        assert!(map.contains_key("c2"));
+    }
+
+    #[test]
+    fn collect_check_items_recurses_into_submenus() {
+        let mut submenu = MenuChild::new_submenu("Sub", true, None);
+        let check = MenuChild::new_check("Nested", true, true, None, Some(MenuId::new("nested_check")));
+        submenu.children = Some(vec![Rc::new(RefCell::new(check))]);
+        let children: Vec<Rc<RefCell<MenuChild>>> = vec![
+            Rc::new(RefCell::new(submenu)),
+        ];
+        collect_check_items(&children);
+        let map = CHECK_ITEMS.lock().unwrap();
+        assert!(map.contains_key("nested_check"));
+    }
+
+    #[test]
+    fn collect_check_items_clears_previous_entries() {
+        // First collect with one item
+        let children1: Vec<Rc<RefCell<MenuChild>>> = vec![
+            Rc::new(RefCell::new(MenuChild::new_check("A", true, true, None, Some(MenuId::new("old_check"))))),
+        ];
+        collect_check_items(&children1);
+        assert!(CHECK_ITEMS.lock().unwrap().contains_key("old_check"));
+
+        // Then collect with different items — old should be gone
+        let children2: Vec<Rc<RefCell<MenuChild>>> = vec![
+            Rc::new(RefCell::new(MenuChild::new_check("B", true, false, None, Some(MenuId::new("new_check"))))),
+        ];
+        collect_check_items(&children2);
+        let map = CHECK_ITEMS.lock().unwrap();
+        assert!(!map.contains_key("old_check"));
+        assert!(map.contains_key("new_check"));
+    }
+
+    // ─── Checked state toggle ─────────────────────────────────────────────
+
+    #[test]
+    fn check_item_toggle_checked_state() {
+        let mut child = MenuChild::new_check("Toggle", true, false, None, None);
+        assert!(!child.is_checked());
+        child.set_checked(true);
+        assert!(child.is_checked());
+        child.set_checked(false);
+        assert!(!child.is_checked());
+    }
+
+    #[test]
+    fn regular_item_is_checked_returns_false() {
+        let child = MenuChild::new("Regular", true, None, None);
+        assert!(!child.is_checked());
+    }
+
+    // ─── Predefined item types ────────────────────────────────────────────
+
+    #[test]
+    fn predefined_separator() {
+        let child = MenuChild::new_predefined(PredefinedMenuItemType::Separator, None);
+        let data = child.to_menu_item_data();
+        assert_eq!(data.predefined_type.unwrap(), "separator");
+    }
+
+    #[test]
+    fn predefined_copy_cut_paste_selectall() {
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Copy, None).to_menu_item_data().predefined_type.unwrap(), "copy");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Cut, None).to_menu_item_data().predefined_type.unwrap(), "cut");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Paste, None).to_menu_item_data().predefined_type.unwrap(), "paste");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::SelectAll, None).to_menu_item_data().predefined_type.unwrap(), "selectAll");
+    }
+
+    #[test]
+    fn predefined_undo_redo() {
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Undo, None).to_menu_item_data().predefined_type.unwrap(), "undo");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Redo, None).to_menu_item_data().predefined_type.unwrap(), "redo");
+    }
+
+    #[test]
+    fn predefined_window_ops() {
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Minimize, None).to_menu_item_data().predefined_type.unwrap(), "minimize");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Maximize, None).to_menu_item_data().predefined_type.unwrap(), "maximize");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Fullscreen, None).to_menu_item_data().predefined_type.unwrap(), "fullscreen");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::CloseWindow, None).to_menu_item_data().predefined_type.unwrap(), "close");
+    }
+
+    #[test]
+    fn predefined_app_ops() {
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Quit, None).to_menu_item_data().predefined_type.unwrap(), "quit");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Hide, None).to_menu_item_data().predefined_type.unwrap(), "hide");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::HideOthers, None).to_menu_item_data().predefined_type.unwrap(), "hideOthers");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::ShowAll, None).to_menu_item_data().predefined_type.unwrap(), "showAll");
+    }
+
+    #[test]
+    fn predefined_misc_ops() {
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::Services, None).to_menu_item_data().predefined_type.unwrap(), "services");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::BringAllToFront, None).to_menu_item_data().predefined_type.unwrap(), "bringAllToFront");
+        assert_eq!(MenuChild::new_predefined(PredefinedMenuItemType::None, None).to_menu_item_data().predefined_type.unwrap(), "none");
+    }
+
+    #[test]
+    fn predefined_separator_has_default_text() {
+        let child = MenuChild::new_predefined(PredefinedMenuItemType::Separator, None);
+        let data = child.to_menu_item_data();
+        // Separator default text comes from item_type.text()
+        assert!(data.text.is_some());
+    }
+
+    #[test]
+    fn predefined_custom_text_override() {
+        let child = MenuChild::new_predefined(PredefinedMenuItemType::Copy, Some("Copy to Clipboard".to_string()));
+        let data = child.to_menu_item_data();
+        assert_eq!(data.text, Some("Copy to Clipboard".to_string()));
+    }
+
+    // ─── Icon item ────────────────────────────────────────────────────────
+
+    #[test]
+    fn icon_item_serializes_icon_to_base64_png() {
+        let icon = Icon {
+            inner: PlatformIcon {
+                raw: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255],
+                width: 2,
+                height: 2,
+            },
+        };
+        let child = MenuChild::new_icon("Colored", true, Some(icon), None, None);
+        let data = child.to_menu_item_data();
+        assert_eq!(data.item_type, "icon");
+        assert!(data.icon.is_some());
+        // The icon should be valid base64
+        let icon_b64 = data.icon.unwrap();
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &icon_b64).unwrap();
+        // Should start with PNG magic
+        assert_eq!(&decoded[1..4], b"PNG");
+    }
+
+    #[test]
+    fn icon_item_without_icon() {
+        let child = MenuChild::new_icon("NoIcon", true, None, None, None);
+        let data = child.to_menu_item_data();
+        assert_eq!(data.item_type, "icon");
+        assert!(data.icon.is_none());
+    }
+
+    // ─── Menu id ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn menu_new_generates_id() {
+        let menu = Menu::new(None);
+        assert!(!menu.id().0.is_empty());
+    }
+
+    #[test]
+    fn menu_new_uses_provided_id() {
+        let menu = Menu::new(Some(MenuId::new("custom_menu")));
+        assert_eq!(menu.id().0, "custom_menu");
+    }
+
+    #[test]
+    fn menu_child_new_generates_id() {
+        let child = MenuChild::new("Test", true, None, None);
+        assert!(!child.id().0.is_empty());
+    }
+
+    #[test]
+    fn menu_child_new_uses_provided_id() {
+        let child = MenuChild::new("Test", true, None, Some(MenuId::new("child_id")));
+        assert_eq!(child.id().0, "child_id");
+    }
+
+    // ─── skip_serializing_if: Option fields must be absent (not null) when None ──
+    // This is a regression guard for the OHOS 401 error: if serde emits `null`
+    // for None Option fields instead of omitting them, ArkTS statusBarManager
+    // rejects the JSON with a 401 "check param error". The skip_serializing_if
+    // attributes on MenuItemData must ensure absent, not null.
+
+    #[test]
+    fn to_json_none_options_are_absent_not_null() {
+        // A plain MenuItem with no accelerator, icon, predefined_type, checked, etc.
+        // All Option fields should be ABSENT from the JSON — not present as `null`.
+        let child = MenuChild::new("Plain", true, None, Some(MenuId::new("plain_id")));
+        let json_str = child.to_menu_item_data().id; // just verify struct works
+        let _ = json_str;
+        let data = child.to_menu_item_data();
+        let json = serde_json::to_string(&data).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+
+        // These fields have skip_serializing_if = "Option::is_none" and should
+        // be ABSENT from the JSON when None (not present as null)
+        assert!(!obj.contains_key("accelerator"), "accelerator should be absent, not null");
+        assert!(!obj.contains_key("predefinedType"), "predefinedType should be absent, not null");
+        assert!(!obj.contains_key("checked"), "checked should be absent, not null");
+        assert!(!obj.contains_key("icon"), "icon should be absent, not null");
+        assert!(!obj.contains_key("nativeIcon"), "nativeIcon should be absent, not null");
+        assert!(!obj.contains_key("submenuItems"), "submenuItems should be absent, not null");
+        assert!(!obj.contains_key("aboutMetadata"), "aboutMetadata should be absent, not null");
+
+        // These fields are always present (not Option with skip)
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("type"));
+        assert!(obj.contains_key("text"));
+        assert!(obj.contains_key("enabled"));
+    }
+
+    #[test]
+    fn to_json_none_values_not_null_in_menu_json() {
+        // Verify via Menu::to_json() that None Option fields produce absent keys
+        // (not null values) in the serialized JSON array
+        let mut menu = Menu::new(None);
+        let item = Rc::new(RefCell::new(MenuChild::new("Plain", true, None, None)));
+        menu.children.push(item);
+        let json_str = menu.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let items = parsed.as_array().unwrap();
+        let obj = items[0].as_object().unwrap();
+
+        // No null values should appear for absent Option fields
+        for key in &["accelerator", "predefinedType", "checked", "icon", "nativeIcon", "submenuItems", "aboutMetadata"] {
+            assert!(
+                !obj.contains_key(*key),
+                "{} should be absent (not null) when None — key present: {}",
+                key, obj.contains_key(*key)
+            );
+        }
+    }
+
+    #[test]
+    fn to_json_some_values_present_in_json() {
+        // When Option fields are Some, they should be present in the JSON
+        let child = MenuChild::new_check("Toggle", true, true, None, Some(MenuId::new("check_id")));
+        let data = child.to_menu_item_data();
+        let json = serde_json::to_string(&data).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+
+        assert!(obj.contains_key("checked"), "checked should be present when Some");
+        assert_eq!(obj["checked"], serde_json::Value::Bool(true));
     }
 }

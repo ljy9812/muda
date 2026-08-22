@@ -206,6 +206,22 @@ pub use items::*;
 pub use menu::*;
 pub use menu_id::MenuId;
 
+/// Injects the `MenuClient` created by tray-icon or tauri at startup.
+/// muda does not hold an `OpenHarmonyApp` reference, so it cannot create its own client.
+#[cfg(target_env = "ohos")]
+pub use platform_impl::set_menu_client;
+
+/// Sends a menu event into muda's OHOS event channel (called by tray-icon to
+/// bridge StatusBar menu clicks into muda's event stream).
+#[cfg(target_env = "ohos")]
+pub use platform_impl::send_menu_event;
+
+/// Dispatches a menu bridge call onto muda's dedicated OHOS worker thread
+/// (called by tauri's window helpers to serialise all menu dispatches through
+/// one FIFO queue, preventing flicker from out-of-order set_menu/remove_menu).
+#[cfg(target_env = "ohos")]
+pub use platform_impl::dispatch_menu_bridge_call;
+
 /// An enumeration of all available menu types, useful to match against
 /// the items returned from [`Menu::items`] or [`Submenu::items`]
 #[derive(Clone)]
