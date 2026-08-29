@@ -389,23 +389,25 @@ impl MenuChild {
 
 /// Map NativeIcon variants to OHOS system symbol resource names.
 ///
-/// Only a few NativeIcon variants have confirmed OHOS system symbol equivalents
-/// at API 12 (compileSdkVersion 5.0.0). Most of the 56 NativeIcon variants are
-/// macOS-specific UI metaphors with no OHOS counterpart.
+/// Only NativeIcon variants with an OHOS system symbol equivalent are mapped.
+/// Names are validated against the SDK's compile-time system resource table
+/// (`sysResource.js`, `sys.symbol` section), which governs whether `$r()` compiles.
 ///
-/// Validated symbols: ohos_star (Add), ohos_lock (LockLocked), ohos_wifi (Network).
+/// Validated symbols: ohos_star (Add), ohos_lock (LockLocked), ohos_wifi (Network),
+/// folder (Folder — no `ohos_` prefix; `ohos_folder` does not exist).
 /// All other variants map to `None` (no icon), consistent with Windows/Linux behavior
 /// where unmapped NativeIcons render without an icon.
 ///
-/// When the SDK adds more system symbols (e.g. ohos_trash, ohos_share), this mapping
-/// can be extended. The ArkTS side (MenuBarComponent.nativeIconSymbol) must also be
-/// updated with a matching `$r()` case.
+/// When more symbols are needed, look them up in the SDK symbol table first
+/// (`sysResource.js` symbol section), then extend both this mapping and the ArkTS
+/// side (MenuBarComponent.nativeIconResource), which needs a matching `$r()` case.
 fn native_icon_to_ohos(icon: NativeIcon) -> Option<&'static str> {
     match icon {
         NativeIcon::Add => Some("sys.symbol.ohos_star"),
         NativeIcon::LockLocked => Some("sys.symbol.ohos_lock"),
         NativeIcon::Network => Some("sys.symbol.ohos_wifi"),
-        // All other variants: no confirmed system symbol at API 12
+        NativeIcon::Folder => Some("sys.symbol.folder"),
+        // All other variants: no OHOS system symbol equivalent
         _ => None,
     }
 }
@@ -967,12 +969,17 @@ mod tests {
     }
 
     #[test]
+    fn native_icon_folder_maps_to_sys_symbol_folder() {
+        // Folder uses the unprefixed `folder` symbol; `ohos_folder` does not exist
+        assert_eq!(native_icon_to_ohos(NativeIcon::Folder), Some("sys.symbol.folder"));
+    }
+
+    #[test]
     fn native_icon_unmapped_returns_none() {
-        // Variants without a confirmed OHOS system symbol return None
+        // Variants without an OHOS system symbol equivalent return None
         assert_eq!(native_icon_to_ohos(NativeIcon::Bluetooth), None);
         assert_eq!(native_icon_to_ohos(NativeIcon::Bookmarks), None);
         assert_eq!(native_icon_to_ohos(NativeIcon::Caution), None);
-        assert_eq!(native_icon_to_ohos(NativeIcon::Folder), None);
         assert_eq!(native_icon_to_ohos(NativeIcon::TrashEmpty), None);
     }
 
