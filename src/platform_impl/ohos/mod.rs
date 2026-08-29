@@ -75,8 +75,13 @@ static MENU_CLIENT: once_cell::sync::OnceCell<openharmony_ability_plugin_menu::M
 /// Called by tray-icon (or tauri) at startup to inject the MenuClient.
 /// muda does not create its own MenuClient (it does not hold OpenHarmonyApp).
 pub fn set_menu_client(client: openharmony_ability_plugin_menu::MenuClient) {
+    // Idempotent: OnceCell cannot be overwritten, so on a second call we warn
+    // and return instead of panicking. The first-call behavior is unchanged.
     if MENU_CLIENT.set(client).is_err() {
-        panic!("MENU_CLIENT already set");
+        log::warn!(
+            "[muda] set_menu_client called more than once; ignoring duplicate initialization"
+        );
+        return;
     }
     // Eagerly initialize the event channel so the sender is registered with
     // plugin-menu before any bridge event can arrive.
@@ -1191,6 +1196,8 @@ mod tests {
 
     #[test]
     fn collect_check_items_collects_check_states() {
+        // Save global state and restore at the end to avoid leaking across tests.
+        let saved = std::mem::take(&mut *CHECK_ITEMS.lock().unwrap());
         let children: Vec<Rc<RefCell<MenuChild>>> = vec![
             Rc::new(RefCell::new(MenuChild::new_check("A", true, true, None, Some(MenuId::new("c1"))))),
             Rc::new(RefCell::new(MenuChild::new("Regular", true, None, None))),
@@ -1201,10 +1208,14 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert!(map.contains_key("c1"));
         assert!(map.contains_key("c2"));
+        drop(map);
+        *CHECK_ITEMS.lock().unwrap() = saved;
     }
 
     #[test]
     fn collect_check_items_recurses_into_submenus() {
+        // Save global state and restore at the end to avoid leaking across tests.
+        let saved = std::mem::take(&mut *CHECK_ITEMS.lock().unwrap());
         let mut submenu = MenuChild::new_submenu("Sub", true, None);
         let check = MenuChild::new_check("Nested", true, true, None, Some(MenuId::new("nested_check")));
         submenu.children = Some(vec![Rc::new(RefCell::new(check))]);
@@ -1214,10 +1225,14 @@ mod tests {
         collect_check_items(&children);
         let map = CHECK_ITEMS.lock().unwrap();
         assert!(map.contains_key("nested_check"));
+        drop(map);
+        *CHECK_ITEMS.lock().unwrap() = saved;
     }
 
     #[test]
     fn collect_check_items_clears_previous_entries() {
+        // Save global state and restore at the end to avoid leaking across tests.
+        let saved = std::mem::take(&mut *CHECK_ITEMS.lock().unwrap());
         // First collect with one item
         let children1: Vec<Rc<RefCell<MenuChild>>> = vec![
             Rc::new(RefCell::new(MenuChild::new_check("A", true, true, None, Some(MenuId::new("old_check"))))),
@@ -1233,6 +1248,8 @@ mod tests {
         let map = CHECK_ITEMS.lock().unwrap();
         assert!(!map.contains_key("old_check"));
         assert!(map.contains_key("new_check"));
+        drop(map);
+        *CHECK_ITEMS.lock().unwrap() = saved;
     }
 
     // ─── Checked state toggle ─────────────────────────────────────────────
@@ -1381,8 +1398,6 @@ mod tests {
         // A plain MenuItem with no accelerator, icon, predefined_type, checked, etc.
         // All Option fields should be ABSENT from the JSON — not present as `null`.
         let child = MenuChild::new("Plain", true, None, Some(MenuId::new("plain_id")));
-        let json_str = child.to_menu_item_data().id; // just verify struct works
-        let _ = json_str;
         let data = child.to_menu_item_data();
         let json = serde_json::to_string(&data).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
