@@ -83,7 +83,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 png = "0.18"
-openharmony-ability-plugin-menu = { path = "../openharmony-ability/crates/plugin-menu" }
+openharmony-ability-plugin-menu = { git = "https://github.com/Eulogizethesun/openharmony-ability", branch = "ohdev-git" }
 futures-executor = "0.3"
 log = "0.4"
 
